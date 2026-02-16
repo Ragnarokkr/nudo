@@ -1,0 +1,1067 @@
+#!/usr/bin/env nu
+
+# NuDo
+# Simple Self-Contained Todo/Task CLI Tool for Nushell
+#
+# Version: 0.1.0
+# Author: Marco Trulla
+# License: MIT
+
+# ----------------------------------------------------------------------------
+#                             Application Metadata
+# ----------------------------------------------------------------------------
+
+const APP_VERSION: string = '0.1.0'
+const CONFIG_FILE: path = 'nudo.toml'
+const DB_NAME: path = 'nudo.db'
+
+# ----------------------------------------------------------------------------
+#                                   Messages
+# ----------------------------------------------------------------------------
+
+const MESSAGES = {
+    error_empty_list: 'there is no items to choose from.'
+    error_exception: 'an error occured while accessing the database. All changes discared. ({error})'
+    error_no_editor: 'no editor available to edit the selected {item}.'
+    error_projects_no_column: 'column {column} is not assigned to the project.'
+    error_projects_no_columns: 'at least one column name must be provided.'
+    error_projects_not_found: 'no projects found.'
+    error_tasks_malformed_data: 'provided data is not correct. Please check it and try again.'
+    success_projects_created: 'project {name} has been created.'
+    success_projects_deleted: 'project {name} has been deleted.'
+    success_projects_renamed: 'project {old_name} has been renamed to {new_name}.'
+    success_session_set_project: 'project {name} now is the default.'
+    success_tasks_created: 'task has been created.'
+    success_tasks_deleted: 'tasks have been deleted.'
+    success_tasks_updated: 'task have been updated.'
+    success_todos_created: 'todo for {column} has been created.'
+    success_todos_deleted: 'todo has been deleted.'
+    success_todos_renamed: 'todo has been moved from {old_column} to {new_column}.'
+    success_todos_updated: 'todo has been updated.'
+    warn_item_delete: 'the {item} will be lost.'
+    warn_multi_items: 'there is more than one item to choose from.'
+    warn_no_changes: 'no changes were made. Operation has been cancelled.'
+    warn_no_operation: 'operation has been cancelled.'
+    warn_projects_delete: 'all project data will be lost.'
+    warn_projects_multiple: 'more than one project with the specified name was found.'
+    warn_session_no_default: 'no default project is set.'
+    warn_session_same_project: 'the project is already set as default.'
+}
+
+# ----------------------------------------------------------------------------
+#                               Database Schema
+# ----------------------------------------------------------------------------
+
+const SESSION_SQL = r#'CREATE TABLE IF NOT EXISTS session (
+    project_id VARCHAR(36) NOT NULL, -- project id
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)'#
+
+const PROJECTS_SQL = r#'CREATE TABLE IF NOT EXISTS projects (
+    id              VARCHAR(36)     PRIMARY KEY,                            -- UUID
+    name            VARCHAR(255)    NOT NULL,                               -- project name
+    creation_date   DATETIME        NOT NULL    DEFAULT(DATETIME('NOW'))    -- project creation date
+)'#
+
+const COLUMNS_SQL = r#'CREATE TABLE IF NOT EXISTS columns (
+    id              VARCHAR(36)     PRIMARY KEY,                -- UUID
+    name            VARCHAR(255)    UNIQUE NOT NULL             -- column name
+)'#
+
+const COLUMNS_PROJECT_SQL = r#'CREATE TABLE IF NOT EXISTS columns_project (
+    column_id   VARCHAR(36) NOT NULL,                                   -- column UUID
+    project_id  VARCHAR(36) NOT NULL,                                   -- project UUID
+    position    INTEGER     NOT NULL    DEFAULT 1,                      -- column position
+    FOREIGN KEY (column_id) REFERENCES columns(id) ON DELETE CASCADE,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+)'#
+
+const TODOS_SQL = r#'CREATE TABLE IF NOT EXISTS todos (
+    id              VARCHAR(36)     PRIMARY KEY,                        -- UUID
+    title           VARCHAR(255)    NOT NULL,                           -- todo title
+    project_id      VARCHAR(36)     NOT NULL,                           -- project reference ID
+    column_id       VARCHAR(36)     NOT NULL,                           -- column reference ID
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (column_id) REFERENCES columns(id) ON DELETE CASCADE
+)'#
+
+const TASKS_SQL = r#'CREATE TABLE IF NOT EXISTS tasks (
+    id              VARCHAR(36)     PRIMARY KEY,                                -- UUID
+    task            TEXT            NOT NULL,                                   -- the content of the task
+    creation_date   DATETIME        NOT NULL        DEFAULT(DATETIME('NOW')),   -- task creation date
+    expiration_date DATETIME,                                                   -- the date the task will expire
+    completion_date DATETIME                                                    -- the date the task has been completed
+)'#
+
+# ----------------------------------------------------------------------------
+#                         File-system related commands
+# ----------------------------------------------------------------------------
+
+# Returns the path for the configuration file.
+def get-config-path []: nothing -> path {
+    if $nu.os-info.name == linux {
+        if XDG_CONFIG_PATH in $env {
+            [$env.XDG_CONFIG_PATH nudo] | path join $CONFIG_FILE
+        } else {
+            [$env.HOME .config nudo] | path join $CONFIG_FILE
+        }
+    } else if $nu.os-info.name == windows {
+        if USERPROFILE in $env {
+            [$env.USERPROFILE .config nudo] | path join $CONFIG_FILE
+        } else if HOMEDRIVE in $env and HOMEPATH in $env {
+            [$env.HOMEDRIVE $env.HOMEPATH .config nudo] | path join $CONFIG_FILE
+        }
+    }
+}
+
+# Returns the path for the database.
+def get-db-path []: nothing -> path {
+    if $nu.os-info.name == linux {
+        if XDG_DATA_PATH in $env {
+            [$env.XDG_DATA_PATH nudo] | path join $DB_NAME
+        } else {
+            [$env.HOME .local share nudo] | path join $DB_NAME
+        }
+    } else if $nu.os-info.name == windows {
+        if LOCALAPPDATA in $env {
+            [$env.LOCALAPPDATA nudo] | path join $DB_NAME
+        } else if APPDATA in $env {
+            [$env.APPDATA nudo] | path join $DB_NAME
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+#                        Configuration related commands
+# ----------------------------------------------------------------------------
+
+# Returns the default configuration.
+def get-default-config []: nothing -> record {
+    {
+        palette: {
+            default: { fg: '#bbbbbb' }
+            error: { fg: '#bf3000' }
+            item: { fg: '#ffffff' }
+            success: { fg: '#00bf00' }
+            warning: { fg: '#bf9000' }
+        }
+        columns: {
+            default: 'backlog,2:todo,3:wip,4:done'
+            palette: {
+                backlog: { fg: '#111111' bg: '#888888' }
+                done: { fg: '#111111' bg: '#00bf3f' }
+                todo: { fg: '#111111' bg: '#00bfcf' }
+                wip: { fg: '#111111' bg: '#efbf00' }
+            }
+        }
+    }
+}
+
+# Loads the configuration or creates it if not exists.
+def load-config [] {
+    let config_path = get-config-path
+    mut config = get-default-config
+    if not ($config_path | path exists) {
+        mkdir ($config_path | path dirname)
+        $config | to toml | save -f $config_path
+    } else {
+        $config = open $config_path
+    }
+    $config
+}
+
+# ----------------------------------------------------------------------------
+#                          Database related commands
+# ----------------------------------------------------------------------------
+
+# Reads the database.
+def open-db []: nothing -> table {
+    stor import -f (get-db-path)
+}
+
+# Saves the changes into the database.
+def save-db []: nothing -> table {
+    let db_path = get-db-path
+    if ($db_path | path exists) { rm -fp $db_path }
+    stor export -f $db_path
+}
+
+# Creates the database.
+def create-db []: nothing -> table {
+    stor reset
+    stor open | query db $SESSION_SQL
+    stor open | query db $PROJECTS_SQL
+    stor open | query db $COLUMNS_SQL
+    stor open | query db $COLUMNS_PROJECT_SQL
+    stor open | query db $TODOS_SQL
+    stor open | query db $TASKS_SQL
+}
+
+# Initializes the database.
+def init-db []: nothing -> table {
+    let db_path = get-db-path
+    if not ($db_path | path exists) {
+        mkdir ($db_path | path dirname)
+        create-db
+        save-db
+    } else {
+        open-db
+    }
+}
+
+# A wrapper to run a closure and (optionally) save the changes into the database.
+def db-state-wrapper [
+    closure: closure
+    --save (-s)
+]: nothing -> nothing {
+    init-db
+    try {
+        if $save { stor open | query db 'BEGIN TRANSACTION' }
+        do $closure
+        if $save {
+            stor open | query db 'COMMIT'
+            save-db | ignore
+        }
+    } catch {|err|
+        if $save { stor open | query db 'ROLLBACK' }
+        print-msg -t error $MESSAGES.error_exception {error: $err.msg}
+        null
+    }
+}
+
+# ----------------------------------------------------------------------------
+#                                  Utilities
+# ----------------------------------------------------------------------------
+
+# Returns a message.
+#
+# By providing a `data` record, all the record's properties will be replaced
+# into the `message` where the placeholders with the same key name occur.
+def echo-msg [
+    message: string                 # text message
+    data: record = {}               # record of data replacements
+    --type (-t): string = 'info'    # type of message
+] {
+    let palette = (load-config).palette
+
+    let ansi_color = ansi (match $type {
+        info => { $palette.default }
+        success => { $palette.success }
+        warning => { $palette.warning }
+        error => { $palette.error }
+        _ => { $palette.default }
+    })
+
+    mut processed = $message
+    for key in ($data | columns) {
+        let value = $data | get $key
+        let replace = (ansi $palette.item) + (match ($value | describe) {
+            bool => { $value | into string }
+            int => { $value | into string }
+            string => { $value }
+            $t if ($t | str contains 'record') => { $value | to nuon }
+            $t if ($t | str contains 'list') => { $value | to nuon }
+            $t if ($t | str contains 'table') => { $value | to nuon }
+            _ => { '' }
+        }) + (ansi reset) + $ansi_color
+        $processed = $processed | str replace -a $"{($key)}" $replace
+    }
+
+    match $type {
+        $t if $t in [success warning error] => { $"($ansi_color)($type | str capitalize): ($processed)(ansi reset)" }
+        _ => { $"($ansi_color)($processed)(ansi reset)" }
+    }
+}
+
+# Prints a message on console.
+#
+# By providing a `data` record, all the record's properties will be replaced
+# into the `message` where the placeholders with the same key name occur.
+def print-msg [
+    message: string                 # text message
+    data: record = {}               # record of data replacements
+    --type (-t): string = 'info'    # type of message
+]: nothing -> string {
+    match $type {
+        $t if $t in [warning error] => { print -e (echo-msg -t $type $message $data) }
+        _ => { print (echo-msg -t $type $message $data) }
+    }
+}
+
+# Prints a question and returns the answer (y or n).
+def yes-no [
+    question: string                # the question text
+    --default (-d): string = 'n'    # the default answer
+]: nothing -> string {
+    input -n 1 -d ($default | str downcase) ($question + $" (ansi attr_bold)Are you sure? [(if $default == 'y' { 'Y/n' } else { 'y/N' })](ansi reset) ") | str downcase
+}
+
+# Given a table, returns an index or a list of index.
+#
+# If the passed table has no records, `null` is returned; if there is only one
+# record, the first index (0) is returned; otherwise, a selection list is
+# shown and the selection index (or list of selection indeces) is returned.
+def list-select [
+    --multi (-m)                                    # enable multi selection
+    --on-empty: string = $MESSAGES.error_empty_list # a message to print if no records
+    --on-multi: string = $MESSAGES.warn_multi_items # a message to print if more than one record
+    --transformer (-t): closure                     # a closure to transform each record into the selectable data
+]: table -> oneof<int, list<int>, nothing> {
+    let $input = $in
+
+    if ($input | is-empty) {
+        print-msg -t error $on_empty
+        return null
+    }
+
+    if ($input | length) > 1 {
+        print-msg -t warning $on_multi
+        return ($input
+            | (if $transformer != null { each { do $transformer $in } })
+            | (if $multi { input list -im 'Select one or more:' } else { input list -i 'Select, or type to search:' })
+        )
+    }
+
+    0
+}
+
+# Given a list of items, a conversion closure is applied to each item, then
+# the maximum occupied width is returned.
+#
+# The closure receives `$in` from the list and must return a string.
+def get-max-width [
+    closure: closure # Transformation closure
+]: list -> number {
+    $in | each {do $closure $in} | str length | math max
+}
+
+# Returns a value according to the matched key name.
+#
+# The matching is perfomed with `=~` (LIKE) operator.
+def get-value-by-key-match [
+    key: string         # Key to search for
+    --default (-d): any # Default value if not key was found
+]: record -> any {
+    let input = $in
+    mut ret_val = $default
+
+    for k in ($input | columns) {
+        if $key =~ $k {
+            $ret_val = $input | get $k
+            break
+        }
+    }
+
+    $ret_val
+}
+
+# Returns a header with a message.
+#
+# Provided `data` will be replaced into the message.
+def render-header [
+    message: string
+    data: record = {}
+] {
+    let sep = '' | fill -w (term size).columns -c '-'
+    ($sep + (char newline) + (echo-msg $message $data) + (char newline) + $sep)
+}
+
+# Generates a temporary file with empty or pipelined contents and edit it
+# with the default system editor.
+#
+# It relies on the `EDITOR` environment variable to start the editor. If the
+# variable is not set, then it will fallback to the `VISUAL` variable. If no
+# variables are found, it simply returns.
+def temp-edit []: [nothing -> string, string -> string] {
+    if ('EDITOR' not-in $env) and ('VISUAL' not-in $env) {
+        print -e $MESSAGES.error_no_editor
+        return null
+    }
+
+    let $input = $in
+    let tmp_file = mktemp -t nudo-edit.XXX
+    if $input != null { $input | save -f $tmp_file } else { touch $tmp_file }
+
+    if ('EDITOR' in $env) { ^$env.EDITOR $tmp_file } else { ^$env.VISUAL -w $tmp_file }
+    let $content = open $tmp_file | str trim
+    rm -fp $tmp_file
+
+    $content
+}
+
+# ----------------------------------------------------------------------------
+#                           Session related commands
+# ----------------------------------------------------------------------------
+
+# Returns current session data.
+def get-session []: nothing -> oneof<nothing, table> {
+    stor open
+    | query db r#'
+        SELECT s.project_id AS id, p.name
+        FROM session AS s
+        JOIN projects AS p
+        WHERE s.project_id = p.id'#
+    | first
+}
+
+# Creates or updates current session data.
+def update-session [
+    project_id: string  # Current project UUID
+]: nothing -> nothing {
+    let session_qry = stor open | query db 'SELECT project_id FROM session' | first
+    if ($session_qry | is-empty) {
+        stor open | query db 'INSERT INTO session (project_id) VALUES (?)' -p [$project_id]
+    } else {
+        stor open | query db 'UPDATE session SET project_id = ?' -p [$project_id]
+    }
+}
+
+# ----------------------------------------------------------------------------
+#                          Projects related commands
+# ----------------------------------------------------------------------------
+
+# Gets the stored projects.
+def get-projects [
+    --by-id (-i): string    # Project ID (UUID)
+    --by-name (-n): string  # Project name
+]: nothing -> table {
+    if $by_id != null {
+        # When retrieved by ID, only one record can be returned
+        stor open | query db 'SELECT id, name, creation_date FROM projects WHERE id = ? LIMIT 1' -p [$by_id]
+    } else if $by_name != null {
+        # When retrieved by name, one or more records can be returned
+        stor open | query db 'SELECT id, name, creation_date FROM projects WHERE name = ? ORDER BY creation_date, name' -p [$by_name]
+    } else {
+        # In all other cases, one or more records can be returned
+        stor open | query db 'SELECT id, name, creation_date FROM projects ORDER BY creation_date, name'
+    }
+}
+
+# Returns the ID of a `project`, or the default project ID stored in session if
+# no project is provided.
+def get-project-id [
+    project?: string # Project name
+]: nothing -> string {
+    if ($project | is-not-empty) {
+        let projects_qry = get-projects -n $project
+        let selection: int = $projects_qry | list-select --on-empty $MESSAGES.error_projects_not_found --on-multi $MESSAGES.warn_projects_multiple
+        if $selection == null {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        $projects_qry | (get $selection).id
+    } else {
+        let session = get-session
+        if $session == null { return null }
+        $session.id
+    }
+}
+
+# ----------------------------------------------------------------------------
+#                            TODOs related commands
+# ----------------------------------------------------------------------------
+
+# Gets all columns which belongs to a specific project.
+def get-columns [
+    project_id: string # Project ID (UUID)
+]: nothing -> table {
+    stor open
+    | query db r#'
+        SELECT id, name
+        FROM columns_project
+        JOIN columns ON id = column_id
+        WHERE project_id = ?
+        ORDER BY position'# -p [$project_id]
+}
+
+# Gets all todos from a specific project.
+def get-todos [
+    project_id: string # Project ID (UUID)
+]: nothing -> table {
+    stor open
+    | query db r#'
+        SELECT
+            t.id AS todo_id,
+            t.title AS todo_title,
+            t.column_id AS todo_column_id,
+            p.name AS project_name,
+            c.name AS column_name,
+            cp.position AS column_position
+        FROM todos t
+        JOIN projects p ON t.project_id = p.id
+        JOIN columns c ON t.column_id = c.id
+        JOIN columns_project cp ON t.project_id = cp.project_id AND t.column_id = cp.column_id
+        WHERE t.project_id = ?
+        ORDER BY cp.position'# -p [$project_id]
+
+}
+
+# Parse a column descriptor and returns its position and name component.
+@example 'A column with position 1 (default) and name `Foo`' { 'Foo' | parse-column } --result '[[position name]; [1 Foo]]'
+@example 'A column with position 4 and name `Bar`' { '4:Bar' | parse-column } --result '[[position name]; [4 Bar]]'
+@example 'An invalid column descriptor' { 'Baz:7' | parse-column }
+def parse-column []: string -> table {
+    $in | parse -r '^(?:(?<position>\d+):)?(?<name>[a-zA-Z_]\w*)$' | default -e 1 position
+}
+
+# ----------------------------------------------------------------------------
+#                            Task related commands
+# ----------------------------------------------------------------------------
+
+# Gets the stored tasks.
+def get-tasks [
+    --id: string # Task UUID
+]: nothing -> table {
+    if $id != null {
+        stor open | query db 'SELECT id, task, creation_date, completion_date, expiration_date FROM tasks WHERE id = ? ORDER BY creation_date LIMIT 1' -p [$id]
+    } else {
+        stor open | query db 'SELECT id, task, creation_date, completion_date, expiration_date FROM tasks ORDER BY creation_date'
+    }
+}
+
+# Parses the pipelined content of the task to retrieve its parameters.
+def parse-task []: string -> record {
+    const HEADER_DELIMITER = '---'
+
+    let $input = $in | lines | compact
+
+    mut in_header = false
+    mut properties = {}
+
+    for l in $input {
+        if ($l == $HEADER_DELIMITER) and (not $in_header) {
+            $in_header = true
+            continue
+        } else if ($l == $HEADER_DELIMITER) and $in_header {
+            break
+        }
+
+        if $in_header {
+            let parsed_line = $l | parse '{key}:{value}'
+            if ($parsed_line | is-empty) { continue }
+
+            $properties = (match ($parsed_line.0.key | str trim | str downcase) {
+                title => { $properties | upsert title ($parsed_line.0.value | str trim) }
+                expires => { $properties | upsert expires ($parsed_line.0.value | str trim | into datetime) }
+                completed => { $properties | upsert completed ($parsed_line.0.value | str contains 'true') }
+            })
+        }
+    }
+
+    $properties
+}
+
+# ============================================================================
+#                                Main Commands
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+#                                   Projects
+# ----------------------------------------------------------------------------
+
+# Shows all the registered projects.
+def "main projects list" [] {
+    db-state-wrapper {||
+        # Get all the projects
+        let projects_qry = get-projects
+
+        # Prints out the list
+        mut projects = []
+        for p in $projects_qry {
+            let columns_qry = get-columns $p.id | reject id
+            $projects ++= [{id: $p.id project: $p.name columns: ($columns_qry | each {$in.name} | str join ', ')}]
+        }
+        print ($projects)
+    }
+}
+
+# Shows current project set as default.
+def "main projects get-default" [] {
+    db-state-wrapper {||
+        let session_qry = get-session
+        if ($session_qry | is-empty) {
+            print-msg -t warning $MESSAGES.warn_session_no_default
+            return null
+        }
+        print $"($session_qry.name) \(($session_qry.id))"
+    }
+}
+
+# Sets a project as default.
+def "main projects set-default" [
+    project: string # Project name
+] {
+    db-state-wrapper -s {||
+        # Get the project
+        let projects_qry = get-projects -n $project
+        let selection: int = $projects_qry | list-select --on-empty $MESSAGES.error_projects_not_found --on-multi $MESSAGES.warn_projects_multiple
+        if $selection == null {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        # Set the new project if not already set
+        let project_id = $projects_qry | (get $selection).id
+        let session_qry = get-session
+        if ($session_qry | is-not-empty) {
+            if $session_qry.id == $project_id {
+                print-msg -t warning $MESSAGES.warn_session_same_id
+                return null
+            }
+            update-session ($projects_qry | (get $selection).id)
+            print-msg -t success $MESSAGES.success_session_set_project {name: ($projects_qry | (get $selection).name)}
+        }
+    }
+}
+
+# Adds a new project.
+def "main projects new" [
+    name: string            # Project name
+    --columns (-c): string  # Columns position and name
+] {
+    # Extracts the columns position and name
+    let column_list: list<record> = if $columns == null {
+        (load-config).columns.default | str downcase | split row ',' | each {$in | str trim | parse-column} | flatten | uniq
+    } else {
+        $columns | str downcase | split row ',' | each {$in | str trim | parse-column} | flatten | uniq
+    }
+    if ($column_list | is-empty) {
+        print-msg -t error $MESSAGES.error_projects_no_columns
+        return null
+    }
+
+    db-state-wrapper -s {||
+        # Add the new project
+        let project_id = random uuid
+        stor open | query db 'INSERT INTO projects (id, name) VALUES (?, ?)' -p [$project_id $name]
+
+        # Update the columns table
+        for c in $column_list {
+            let column_qry = stor open | query db 'SELECT id, name FROM columns WHERE name = ? LIMIT 1' -p [$c.name]
+            if ($column_qry | is-empty) {
+                let column_id = random uuid
+                stor open | query db 'INSERT INTO columns (id, name) VALUES (?, ?)' -p [$column_id $c.name]
+                stor open | query db 'INSERT INTO columns_project (column_id, project_id, position) VALUES (?, ?, ?)' -p [$column_id $project_id $c.position]
+            } else {
+                stor open | query db 'INSERT INTO columns_project (column_id, project_id, position) VALUES (?, ?, ?)' -p [$column_qry.0.id $project_id $c.position]
+            }
+        }
+        print-msg -t success $MESSAGES.success_projects_created {name: $name}
+
+        # Update session if no default project is assigned
+        let session = get-session
+        if $session == null {
+            update-session $project_id
+            print-msg -t success $MESSAGES.success_session_set_project {name: $name}
+        }
+    }
+}
+
+# Deletes a stored project.
+def "main projects delete" [
+    name: string # Project name
+] {
+    db-state-wrapper -s {||
+        # Get the projects
+        let projects_qry = get-projects -n $name
+        let selection: list<int> = $projects_qry | list-select -m --on-empty $MESSAGES.error_projects_not_found --on-multi $MESSAGES.warn_projects_multiple
+        if $selection == null {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        # Delete the projects
+        let answer: string = yes-no (echo-msg -t warning $MESSAGES.warn_projects_delete)
+        if $answer == 'n' {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        let ids = $selection | each {|i| $projects_qry | (get $i).id | $"'($in)'" } | str join ','
+        stor open | query db $"DELETE FROM projects WHERE id IN \(($ids))"
+        print-msg -t success $MESSAGES.success_project_deleted {name: $name}
+
+        # If it was the default project, replace with the first available
+        let session = get-session
+        if $session == null {
+            let next_avail_project = get_projects | first
+            update-session $next_avail_project.id
+            print-msg -t success $MESSAGES.success_session_set_project {name: $next_avail_project.name}
+        }
+    }
+}
+
+# Changes the name of a stored project.
+def "main projects rename" [
+    from_name: string   # Project name
+    to_name: string     # New project name
+] {
+    db-state-wrapper -s {||
+        let projects = get-projects -n $from_name
+        let selection: int = $projects | list-select --on-empty $MESSAGES.error_projects_not_found --on-multi $MESSAGES.warn_projects_multiple
+        if $selection == null {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        stor open | query db 'UPDATE projects SET name = :name WHERE id = :id' -p {name: $to_name id: ($projects | (get $selection).id)}
+        print-msg -t success $MESSAGES.success_projects_renamed {old_name: $from_name new_name: $to_name}
+    }
+}
+
+# ----------------------------------------------------------------------------
+#                                    TODOs
+# ----------------------------------------------------------------------------
+
+# Shows all the TODOs for the current (or specific) project.
+def "main todos list" [
+    --project (-p): string  # Select a specific project instead of the default one
+] {
+    let palette = (load-config).columns.palette
+
+    let render_todo = {|col_width: int, col_name: string, todo_title: string|
+        echo-msg '{column} {todo}' {
+            column: $"(ansi ($palette | get-value-by-key-match $col_name)) ($col_name | fill -w $col_width) (ansi reset)"
+            todo: ($todo_title)
+        }
+    }
+
+    db-state-wrapper {||
+        # Retrieve the project
+        let project_id = get-project-id $project
+        if $project_id == null { return null }
+
+        # Calculate max column width for output
+        let col_width = get-columns $project_id | get-max-width {$in.name}
+
+        # Prints out the list of todos
+        let project_qry = get-projects -i $project_id | first
+        print (render-header 'Project: {project} // ID: {id} // Created: {created}' {
+            project: $project_qry.name
+            id: $project_qry.id
+            created: $project_qry.creation_date
+        })
+
+        let todos_qry = get-todos $project_id
+        mut items = []
+        for t in $todos_qry {
+            $items ++= [(do $render_todo $col_width $t.column_name $t.todo_title)]
+        }
+
+        print (($items | str join (char newline)) + (char newline))
+    }
+}
+
+# Adds a new TODO to the project.
+def "main todos new" [
+    column: string          # Column name
+    todo?: string           # Todo's title
+    --project (-p): string  # Select a specific project instead of the default one
+] {
+    db-state-wrapper -s {||
+        # Retrieve the project
+        let project_id = get-project-id $project
+        if $project_id == null { return null }
+
+        # Retrieve columns data and check if the specificed column is assigned to the project
+        let column_qry = get-columns $project_id | where name == $column | first
+        if ($column_qry | is-empty) {
+            print-msg -t error $MESSAGES.error_projects_no_column {column: $column}
+            return null
+        }
+
+        # Prepare the todo text to be stored
+        let todo_text = if $todo == null { temp-edit } else { $todo } | str trim
+
+        # Add the todo
+        stor open | query db r#'
+        INSERT INTO todos (id, title, project_id, column_id)
+        VALUES (:id, :title, :project_id, :column_id)'# -p {
+            id: (random uuid)
+            title: $todo_text
+            project_id: $project_id
+            column_id: $column_qry.id
+        }
+        print-msg -t success $MESSAGES.success_todos_created {column: $column}
+    }
+}
+
+# Deletes a TODO from a project.
+def "main todos delete" [
+    --project (-p): string # Select a specific project instead of the default one
+] {
+    db-state-wrapper -s {||
+        # Retrieve the project
+        let project_id = get-project-id $project
+        if $project_id == null { return null }
+
+        # Retrieve all the project's todos
+        let todos_qry = get-todos $project_id
+        let selection: int = $todos_qry | list-select -t {$in.todo_title}
+        if $selection == null {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        # Delete the selected todo
+        let answer = yes-no (echo-msg -t warning $MESSAGES.warn_item_delete | str replace '{item}' 'todo')
+        if $answer == 'n' { return null }
+
+        stor open | query db 'DELETE FROM todos WHERE id = ?' -p [($todos_qry | (get $selection).todo_id)]
+        print-msg -t success $MESSAGES.success_todos_deleted
+    }
+}
+
+# Move a todo from a column to another.
+def "main todos move" [
+    from_column: string     # Current column
+    to_column: string       # Destination column
+    --project (-p): string  # Select a specific project instead of the default one
+] {
+    db-state-wrapper -s {||
+        # Retrieve the project
+        let project_id = get-project-id $project
+        if $project_id == null { return null }
+
+        # Retrieve the column data
+        let columns_qry = get-columns $project_id
+        let from_column_qry = $columns_qry | where name == $from_column | first
+        if $from_column_qry == null {
+            print-msg -t error $MESSAGES.error_projects_no_column {column: $from_column}
+            return null
+        }
+        let to_column_qry = $columns_qry | where name == $to_column | first
+        if $to_column_qry == null {
+            print-msg -t error $MESSAGES.error_projects_no_column {column: $to_column}
+            return null
+        }
+
+        # Select the todo
+        let todos_qry = get-todos $project_id | where todo_column_id == $from_column_qry.id
+        let selection: int = $todos_qry | list-select -t {$in.todo_title}
+        if $selection == null {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        stor open | query db 'UPDATE todos SET column_id = :column_id WHERE id = :id' -p {
+            id: (get-todos $project_id | (get $selection).todo_id)
+            column_id: $to_column_qry.id
+        }
+        print-msg -t success $MESSAGES.success_todos_renamed {old_column: $from_column new_column: $to_column}
+    }
+}
+
+# Edit the title of a project's todo.
+def "main todos edit" [
+    --project (-p): string # Select a specific project instead of the default one
+] {
+    db-state-wrapper -s {||
+        # Retrieve the project
+        let project_id = get-project-id $project
+        if $project_id == null { return null }
+
+        # Select the todo
+        let todos_qry = get-todos $project_id
+        let selection: int = $todos_qry | list-select -t {$in.todo_title}
+        if $selection == null {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        # Edit the todo
+        let todo_text = $todos_qry | (get $selection).todo_title
+        let edited_text = $todo_text | temp-edit
+        if $edited_text == $todo_text {
+            print-msg -t warning $MESSAGES.warn_no_changes
+            return null
+        }
+
+        stor open | query db 'UPDATE todos SET title = :title WHERE id = :id' -p {
+            id: ($todos_qry | (get $selection).todo_id)
+            title: $edited_text
+        }
+        print-msg -t success $MESSAGES.success_todos_updated
+    }
+}
+
+# ----------------------------------------------------------------------------
+#                                    Tasks
+# ----------------------------------------------------------------------------
+
+# Shows all the registered tasks.
+def "main tasks list" [] {
+    let render_task = {|task: record, alt: bool|
+        let checkbox: string = if $task.completion_date != null { '- [x] ' } else { '- [ ] ' }
+        let title: string = $task.task | parse-task | get title
+        let expires: string = if ($task.completion_date == null) and ($task.expiration_date != null) { $" \(expires: ($task.expiration_date | format date '%F %T'))(ansi reset)" } else { '' }
+        let available_space: int = (term size).columns - (($checkbox + $title) | str length)
+        mut $out = $checkbox + $title + ($expires | fill -w $available_space -a right)
+        if $alt { $out = $"(ansi light_gray)($out)(ansi reset)"}
+        $out
+    }
+
+    db-state-wrapper {||
+        # Print the header
+        let tasks_qry = get-tasks
+        let total_qry = $tasks_qry | length
+        let expire_qry = $tasks_qry | where {|r| $r.expiration_date != null and $r.completion_date == null} | length
+        let complete_qry = $tasks_qry | where completion_date != null | length
+        print (render-header 'TASKS - Total: {total} // Expiring: {expire} // Completed: {complete}' {
+            total: $total_qry
+            expire: $expire_qry
+            complete: $complete_qry
+        })
+
+        # Print the tasks
+        mut items = []
+        mut i = 0
+        for t in $tasks_qry {
+            $items ++= [(do $render_task $t ($i mod 2 == 0))]
+            $i += 1
+        }
+        print (($items | str join (char newline)) + (char newline))
+    }
+
+}
+
+# Adds a new task.
+def "main tasks new" [] {
+    db-state-wrapper -s {||
+        # Create the task
+        const TASK_TMPL = $"---(char newline)title:(char newline)expires:(char newline)completed:(char newline)---(char newline)"
+        let task_text = $TASK_TMPL | temp-edit | str trim
+        if $task_text == null {
+            print-msg -t warning $MESSAGES.warn_no_changes
+            return null
+        }
+
+        # Parse and verify the metadata
+        let task_data = $task_text | parse-task
+        if title not-in $task_data {
+            print-msg -t error $MESSAGES.error_tasks_malformed_data
+            return null
+        }
+
+        # Stores the task
+        if expires not-in $task_data {
+            stor open | query db 'INSERT INTO tasks (id, task) VALUES (?, ?)' -p [(random uuid) $task_text]
+        } else {
+            stor open | query db 'INSERT INTO tasks (id, task, expiration_date) VALUES (?, ?, ?)' -p [
+                (random uuid)
+                $task_text
+                ($task_data.expires | format date '%F %T')
+            ]
+        }
+        print-msg -t success $MESSAGES.success_tasks_created
+    }
+}
+
+# Deletes a task.
+def "main tasks delete" [] {
+    db-state-wrapper -s {||
+        # Get the tasks
+        let tasks_qry = get-tasks
+        let selection: list<int> = $tasks_qry | list-select -mt {$in.task | (parse-task).title }
+        if ($selection | is-empty) {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        # Delete the tasks
+        let answer = yes-no ($MESSAGES.warn_item_delete | str replace '{item}' 'tasks')
+        if $answer == 'n' { return null }
+
+        stor open
+        | query db $"DELETE FROM tasks WHERE id IN \(($selection | each {|i| $tasks_qry | (get $i).id | |$"'($in)'"} | str join ','))"
+        print-msg -t success $MESSAGES.success_tasks_deleted
+    }
+}
+
+# Edits a task.
+def "main tasks edit" [] {
+    db-state-wrapper -s {||
+        # Get the tasks not yet completed
+        let tasks_qry = get-tasks | where completion_date == null
+        let selection: int = $tasks_qry | list-select -t {$in.task | (parse-task).title}
+        if $selection == null {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        # Edit the task
+        let task_text = $tasks_qry | (get $selection).task
+        let edited_task = $task_text | temp-edit
+        if $edited_task == $task_text {
+            print-msg -t warning $MESSAGES.warn_no_changes
+            return null
+        }
+
+        # Check and save the changes
+        let task_data = $edited_task | parse-task
+        if title not-in $task_data {
+            print-msg -t error $MESSAGES.error_tasks_malformed_data
+            return null
+        }
+
+        mut query_fields = ['task = :task']
+        mut query_params = {
+            id: ($tasks_qry | (get $selection).id)
+            task: $edited_task
+        }
+        if expires in $task_data {
+            $query_fields ++= ['expiration_date = :expires']
+            $query_params = $query_params | upsert expires ($task_data.expires | format date '%F %T')
+        }
+        if completed in $task_data and $task_data.completed {
+            $query_fields ++= ['completion_date = :completed']
+            $query_params = $query_params | upsert completed (date now | format date '%F %T')
+        }
+
+        stor open | query db ('UPDATE tasks SET ' + ($query_fields | str join ', ') + ' WHERE id = :id') -p $query_params
+        print-msg -t success $MESSAGES.success_tasks_updated
+    }
+}
+
+# Shows the task details.
+def "main tasks view" [] {
+    db-state-wrapper {||
+        # Get the tasks
+        let tasks_qry = get-tasks
+        let selection: int = $tasks_qry | list-select -t {$in.task | (parse-task).title}
+        if $selection == null {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        # Prints out the details
+        let task_text = $tasks_qry | (get $selection).task
+        if (which glow | is-not-empty) {
+            $task_text | glow -pn
+        } else if (which bat | is-not-empty) {
+            $task_text | bat -p -l markdown --italic-text=always
+        } else if PAGER in $env {
+            $task_text | ^$env.PAGER
+        } else {
+            print $"($task_text)(char newline)"
+        }
+    }
+}
+
+# NuDo - Simple Self-Contained Todo/Task CLI Tool for Nushell
+def main [
+    --debug         # Prints debug informations
+    --version (-V)  # Prints the version
+] {
+    if $debug {
+        return ({
+            config_path: (get-config-path)
+            db_path: (get-db-path)
+        } | to json)
+    }
+
+    if $version {
+        $APP_VERSION
+    }
+}
