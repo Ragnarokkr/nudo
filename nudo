@@ -3,7 +3,7 @@
 # NuDo
 # Simple Self-Contained Todo/Task CLI Tool for Nushell
 #
-# Version: 0.1.0
+# Version: 0.1.1
 # Author: Marco Trulla
 # License: MIT
 
@@ -11,7 +11,7 @@
 #                             Application Metadata
 # ----------------------------------------------------------------------------
 
-const APP_VERSION: string = '0.1.0'
+const APP_VERSION: string = '0.1.1'
 const CONFIG_FILE: path = 'nudo.toml'
 const DB_NAME: path = 'nudo.db'
 
@@ -1050,6 +1050,110 @@ def "main tasks view" [] {
             print $"($task_text)(char newline)"
         }
     }
+}
+
+# Prints out the completion code for Nushell.
+def "main completion" [] {
+    r#'module "nudo completions" {
+    def complete-nothing [] { [] }
+
+    def complete-projects [] {
+        let db_path = (^nudo --debug | from json).db_path
+        let project_qry = open $db_path | query db 'SELECT name FROM projects' | get name
+
+        {
+            options: {
+                case_sensitive: true
+            }
+            completions: $project_qry
+        }
+    }
+
+    def complete-columns [
+        context: string
+    ] {
+        let db = open (^nudo --debug | from json).db_path
+        let project_name = $context | parse -r '(?i)(?<=-p|--project)\s+(?<project>\w+)' | first
+        let project_id = if ($project_name | is-not-empty) {
+            ($db | query db 'SELECT id FROM projects WHERE name = ? LIMIT 1' -p [$project_name.project] | first | get id)
+        } else {
+            ($db | query db 'SELECT project_id FROM session LIMIT 1' | first | get project_id)
+        }
+
+        $db
+        | query db 'SELECT name FROM columns JOIN columns_project ON column_id = id WHERE project_id = ?' -p [$project_id]
+        | get name
+    }
+
+    # Todo/Task CLI Tool.
+    export extern nudo [
+        --export        # Exports the database as JSON
+        --import: path  # Imports an exported JSON into the database
+        --debug         # Prints debug informations
+        --version (-V)  # Prints the version
+    ]
+
+    # Shows current project set as default.
+    export extern "nudo projects get-default" []
+    # Sets a project as default.
+    export extern "nudo projects set-default" [
+        --project (-p): string@complete-projects # Project name
+    ]
+    # Shows all the registered projects.
+    export extern "nudo projects list" []
+    # Adds a new project.
+    export extern "nudo projects new" [
+        name: string            # Project name
+        --columns (-c): string  # Columns position and name
+    ]
+    # Deletes a stored project.
+    export extern "nudo projects delete" [
+        name: string@complete-projects  # Project name
+    ]
+    # Changes the name of a stored project.
+    export extern "nudo projects rename" [
+        from_name: string@complete-projects # Project name
+        to_name: string                     # New project name
+    ]
+
+    # Shows all the TODOs for the current (or specific) project.
+    export extern "nudo todos list" [
+        --project (-p): string@complete-projects  # Project name
+    ]
+    # Adds a new TODO to the project.
+    export extern "nudo todos new" [
+        column: string@complete-columns             # Column name
+        todo?: string@complete-nothing              # Todo's title
+        --project (-p): string@complete-projects    # Project name
+    ]
+    # Deletes a TODO from a project.
+    export extern "nudo todos delete" [
+        --project (-p): string@complete-projects    # Project name
+    ]
+    # Move a todo from a column to another.
+    export extern "nudo todos move" [
+        from_column: string@complete-columns        # Current column
+        to_column: string@complete-columns          # Destination column
+        --project (-p): string@complete-projects    # Project name
+    ]
+    # Edit the title of a project's todo.
+    export extern "nudo todos edit" [
+        --project (-p): string@complete-projects    # Project name
+    ]
+
+    # Shows all the registered tasks.
+    export extern "nudo tasks list" []
+    # Adds a new task.
+    export extern "nudo tasks new" []
+    # Deletes a task.
+    export extern "nudo tasks delete" []
+    # Edits a task.
+    export extern "nudo tasks edit" []
+    # Shows the task details.
+    export extern "nudo tasks view" []
+}
+use "nudo completions" *
+    '#
 }
 
 # NuDo - Simple Self-Contained Todo/Task CLI Tool for Nushell
