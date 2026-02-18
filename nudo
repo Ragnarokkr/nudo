@@ -26,6 +26,7 @@ const MESSAGES = {
     error_projects_no_column: 'column {column} is not assigned to the project.'
     error_projects_no_columns: 'at least one column name must be provided.'
     error_projects_not_found: 'no projects found.'
+    error_read: 'unable to read the file.'
     error_tasks_malformed_data: 'provided data is not correct. Please check it and try again.'
     success_projects_created: 'project {name} has been created.'
     success_projects_deleted: 'project {name} has been deleted.'
@@ -59,7 +60,7 @@ const SESSION_SQL = r#'CREATE TABLE IF NOT EXISTS session (
 
 const PROJECTS_SQL = r#'CREATE TABLE IF NOT EXISTS projects (
     id              VARCHAR(36)     PRIMARY KEY,                            -- UUID
-    name            VARCHAR(255)    NOT NULL,                               -- project name
+    name            VARCHAR(255)    UNIQUE NOT NULL,                        -- project name
     creation_date   DATETIME        NOT NULL    DEFAULT(DATETIME('NOW'))    -- project creation date
 )'#
 
@@ -198,9 +199,11 @@ def create-db []: nothing -> table {
 }
 
 # Initializes the database.
-def init-db []: nothing -> table {
+def init-db [
+    --force (-f) # Force the creation of a new database
+]: nothing -> table {
     let db_path = get-db-path
-    if not ($db_path | path exists) {
+    if not ($db_path | path exists) or $force {
         mkdir ($db_path | path dirname)
         create-db
         save-db
@@ -1051,9 +1054,71 @@ def "main tasks view" [] {
 
 # NuDo - Simple Self-Contained Todo/Task CLI Tool for Nushell
 def main [
+    --export        # Exports the database as JSON
+    --import: path  # Imports an exported JSON into the database
     --debug         # Prints debug informations
     --version (-V)  # Prints the version
 ] {
+    if $export {
+        db-state-wrapper {||
+            print (stor open | to json)
+        }
+        return null
+    }
+
+    if ($import | is-not-empty) {
+        let tables: record = try {
+            open $import
+        } catch {|err|
+            print-msg -t error $MESSAGES.error_read_error
+            return null
+        }
+
+        let queries = {
+            session: {
+                query: 'INSERT INTO session (project_id) VALUES (?)'
+                closure: {|r| [$r.project_id]}
+            }
+            projects: {
+                query: 'INSERT INTO projects (id, name, creation_date) VALUES (?, ?, ?)'
+                closure: {|r| [$r.id $r.name $r.creation_date]}
+            }
+            columns: {
+                query: 'INSERT INTO columns (id, name) VALUES (?, ?)'
+                closure: {|r| [$r.id $r.name]}
+            }
+            columns_project: {
+                query: 'INSERT INTO columns_project (column_id, project_id, position) VALUES (?, ?, ?)'
+                closure: {|r| [$r.column_id $r.project_id $r.position]}
+            }
+            todos: {
+                query: 'INSERT INTO todos (id, title, project_id, column_id) VALUES (?, ?, ?, ?)'
+                closure: {|r| [$r.id $r.title $r.project_id $r.column_id]}
+            }
+            tasks: {
+                query: 'INSERT INTO tasks (id, task, creation_date, expiration_date, completion_date) VALUES (?, ?, ?, ?, ?)'
+                closure: {|r| [$r.id $r.task $r.creation_date $r.expiration_date $r.completion_date]}
+            }
+        }
+
+        init-db -f
+        db-state-wrapper -s {||
+
+            for table in ($tables | reject session | columns) {
+                let rows = $tables | get $table
+                for row in $rows {
+                    stor open
+                    | query db ($queries | get $table).query -p (do ($queries | get $table).closure $row)
+                }
+            }
+
+            stor open
+            | query db $queries.session.query -p (do $queries.session.closure $tables.session.0)
+        }
+        print-msg -t success 'database imported.'
+        return null
+    }
+
     if $debug {
         return ({
             config_path: (get-config-path)
