@@ -119,9 +119,9 @@ def get-config-path []: nothing -> path {
 def get-db-path []: nothing -> path {
     if $nu.os-info.name == linux {
         if XDG_DATA_PATH in $env {
-            [$env.XDG_DATA_PATH nudo] | path join $DB_NAME
+            [$env.XDG_DATA_PATH nudo data] | path join $DB_NAME
         } else {
-            [$env.HOME .local share nudo] | path join $DB_NAME
+            [$env.HOME .local share nudo data] | path join $DB_NAME
         }
     } else if $nu.os-info.name == windows {
         if LOCALAPPDATA in $env {
