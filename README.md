@@ -1,6 +1,6 @@
 # NuDo (Nushell toDo)
 
-<div align="center"><img src="cover.jpg"></div>
+<div align="center"><img src="cover.jpg" alt="NuDo Cover"></div>
 
 A simple, self-contained Todo/Task CLI tool built for [Nushell].
 
@@ -14,13 +14,13 @@ A simple, self-contained Todo/Task CLI tool built for [Nushell].
     - [TODOs](#todos)
     - [Tasks](#tasks)
 - [Configuration](#configuration)
-- [File Locations](#file-locations)
+- [File Locations](#default-file-locations)
 - [Dependencies](#dependencies)
 - [License](#license)
 
 ## Introduction
 
-NuDo is a lightweight task management tool written entirely in Nushell script.
+**NuDo** is a lightweight task management tool written entirely in Nushell script.
 It allows you to manage project-specific TODO lists and standalone tasks with
 deadlines directly from your terminal. It leverages Nushell's built-in SQLite
 integration for data persistence.
@@ -30,61 +30,69 @@ integration for data persistence.
 - **Project-based**: Organize TODOs into custom groups (e.g., backlog, todo, wip, done).
 - **Standalone Tasks**: Manage individual tasks with metadata (title, expiration date, completion status).
 - **Self-Contained**: Everything runs from a single script and stores data in a local SQLite database.
-- **Cross-Platform**: Supports Linux and Windows (sorry I have no MacOS to test it).
-- **Integrated Editing**: Uses your system's `$EDITOR`/`$VISUAL` for creating and editing tasks.
+- **Cross-Platform**: Supports Linux and Windows.
+- **Integrated Editing**: Uses your system's `$EDITOR` or `$VISUAL` for creating and editing items.
 - **Beautiful Output**: Color-coded terminal output with optional support for [glow] or [bat] for task viewing.
 
 ## Installation
 
 1. Ensure you have [Nushell] installed.
-2. Download the `nudo` script or clone it (it is also part of my [DoNuT] glazes!).
+2. Download the `nudo` script or clone it (it is also part of the [DoNuT] glazes).
 3. Make it executable: `chmod u+x nudo`
-4. (Optional) Move it to your path: `$env.PATH = [/path/to/your/script] ++ $env.PATH`
+4. (Optional) Add it to your path: `$env.PATH = ($env.PATH | append "/path/to/your/script")`
 
 ## Usage
 
 Run `nudo --help` to see the available commands.
 
+| ACTION                           | COMMAND                                    |
+| -------------------------------- | ------------------------------------------ |
+| Print the completion code        | `nudo completion \| save -f completion.nu` |
+| Export the database to JSON      | `nudo --export \| save -f exported.json`   |
+| Import from JSON to the database | `nudo --import exported.json`              |
+| Show current version             | `nudo --version`                           |
+
+> [!NOTE]
+> Every time a project/todo/task is omitted in a command that requires it, a
+> selection list is shown to let the user choose, unless there is only one
+> possible choice—in that case, the selection is automatic.
+
 ### Projects
 
-Projects allow you to group TODOs. You can set a "default" project to avoid
-specifying it every time.
+Projects allow you to group TODOs. You can set a "default" project to avoid specifying it every time.
 
-| ACTION              | COMMAND                                                              | NOTES                                                       |
-| ------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------- |
+| ACTION              | COMMAND                                                              |
+| ------------------- | -------------------------------------------------------------------- |
 | Create a project    | `nudo projects new "My Project" --columns "1:backlog,2:todo,3:done"` |
-| Delete project      | `nudo projects delete "My Project"`                                  | If the project name is omitted, a selection list will open. |
+| Delete project      | `nudo projects delete "My Project"`                                  |
 | Get default project | `nudo projects get-default`                                          |
 | List projects       | `nudo projects list`                                                 |
 | Rename project      | `nudo projects rename "Old Name" "New Name"`                         |
-| Set default project | `nudo projects set-default "My Project"`                             | If the project name is omitted, a selection list will open. |
-
-Whenever more than one project with the same name is found, a selection list is
-provided to the user.
+| Set default project | `nudo projects set-default "My Project"`                             |
 
 ### TODOs
 
 TODOs are items within a project's columns.
 
-| ACTION      | COMMAND                                 | NOTES                                       |
-| ----------- | --------------------------------------- | ------------------------------------------- |
-| Add a TODO  | `nudo todos new "todo" "My first task"` | If title is omitted, your editor will open. |
-| Delete TODO | `nudo todos delete`                     | Opens selection list.                       |
-| Edit TODO   | `nudo todos edit`                       | Opens selection list and then editor.       |
+| ACTION      | COMMAND                                 |
+| ----------- | --------------------------------------- |
+| Add a TODO  | `nudo todos new "todo" "My first task"` |
+| Delete TODO | `nudo todos delete`                     |
+| Edit TODO   | `nudo todos edit`                       |
 | List TODOs  | `nudo todos list`                       |
-| Move TODO   | `nudo todos move "todo" "done"`         | Opens selection list.                       |
+| Move TODO   | `nudo todos move "todo" "done"`         |
 
 ### Tasks
 
 Tasks are standalone items that include a Markdown-like header for metadata.
 
-| ACTION      | COMMAND             | NOTES                             |
-| ----------- | ------------------- | --------------------------------- |
-| Create task | `nudo tasks new`    | Opens the editor with a template. |
-| Delete task | `nudo tasks delete` |                                   |
-| Edit task   | `nudo tasks edit`   |                                   |
-| List tasks  | `nudo tasks list`   |                                   |
-| View task   | `nudo tasks view`   |                                   |
+| ACTION      | COMMAND             |
+| ----------- | ------------------- |
+| Create task | `nudo tasks new`    |
+| Delete task | `nudo tasks delete` |
+| Edit task   | `nudo tasks edit`   |
+| List tasks  | `nudo tasks list`   |
+| View task   | `nudo tasks view`   |
 
 The default header is as follows:
 
@@ -96,9 +104,9 @@ completed: true
 ---
 ```
 
-Only the `title` field is mandatory. The `expires` field adds a label to the list.
-If the `completed` field is present and set to `true`, the task will be marked
-as done. From that point on, it cannot be edited—only deleted.
+Only the `title` field is mandatory. The `expires` field adds a label to the
+list. If `completed` is set to `true`, the task is marked as done and cannot
+be edited further—only deleted.
 
 ## Configuration
 
@@ -123,20 +131,17 @@ todo = { fg = '#111111', bg = '#00bfcf' }
 wip = { fg = '#111111', bg = '#efbf00' }
 ```
 
-The format to describe each column is `position:column_name`; if `position` is
-omitted, it defaults to position 1
+The format to describe each column is `position:column_name`. If position is
+omitted, it defaults to 1. Under `[columns.palette]`, colors are matched
+using the `=~` (LIKE) operator.
 
-Under the `[columns.palette]` section, it is possible to define the terms used
-to colorize TODO groups. They are matched using the `=~` (`LIKE`) operator,
-meaning that as long as the term is present in the group name, it will be a match.
-
-## File Locations
+## Default File Locations
 
 - Configuration:
     - Linux: `~/.config/nudo/nudo.toml` (or `$XDG_CONFIG_HOME`)
     - Windows: `%USERPROFILE%\.config\nudo\nudo.toml` (or `%HOMEDRIVE%%HOMEPATH%`)
 - Database:
-    - Linux: `~/.local/share/nudo/nudo.db` (or `$XDG_DATA_HOME`)
+    - Linux: `~/.local/share/nudo/data/nudo.db` (or `$XDG_DATA_HOME`)
     - Windows: `%LOCALAPPDATA%\nudo\nudo.db` (or `%APPDATA%`)
 
 ## Dependencies
