@@ -3,7 +3,7 @@
 # NuDo
 # Simple Self-Contained Todo/Task CLI Tool for Nushell
 #
-# Version: 0.1.1
+# Version: 0.2.0
 # Author: Marco Trulla
 # License: MIT
 
@@ -11,7 +11,7 @@
 #                             Application Metadata
 # ----------------------------------------------------------------------------
 
-const APP_VERSION: string = '0.1.1'
+const APP_VERSION: string = '0.2.0'
 const CONFIG_FILE: path = 'nudo.toml'
 const DB_NAME: path = 'nudo.db'
 
@@ -22,12 +22,12 @@ const DB_NAME: path = 'nudo.db'
 const MESSAGES = {
     error_empty_list: 'there is no items to choose from.'
     error_exception: 'an error occured while accessing the database. All changes discared. ({error})'
+    error_malformed_data: 'provided data is not correct. Please check it and try again.'
     error_no_editor: 'no editor available to edit the selected {item}.'
     error_projects_no_column: 'column {column} is not assigned to the project.'
     error_projects_no_columns: 'at least one column name must be provided.'
     error_projects_not_found: 'no projects found.'
     error_read: 'unable to read the file.'
-    error_tasks_malformed_data: 'provided data is not correct. Please check it and try again.'
     success_projects_created: 'project {name} has been created.'
     success_projects_deleted: 'project {name} has been deleted.'
     success_projects_renamed: 'project {old_name} has been renamed to {new_name}.'
@@ -79,7 +79,7 @@ const COLUMNS_PROJECT_SQL = r#'CREATE TABLE IF NOT EXISTS columns_project (
 
 const TODOS_SQL = r#'CREATE TABLE IF NOT EXISTS todos (
     id              VARCHAR(36)     PRIMARY KEY,                        -- UUID
-    title           VARCHAR(255)    NOT NULL,                           -- todo title
+    todo            TEXT            NOT NULL,                           -- the content of the todo
     project_id      VARCHAR(36)     NOT NULL,                           -- project reference ID
     column_id       VARCHAR(36)     NOT NULL,                           -- column reference ID
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
@@ -392,6 +392,17 @@ def temp-edit []: [nothing -> string, string -> string] {
     $content
 }
 
+# Provided a record of properties, returns a valid Markdown header
+def build-metadata-block []: record -> string {
+    const DELIMITER = '---'
+
+    let input: record = $in
+    let properties: string = $input | items {|k, v|
+        $"($k | str trim): ($v | str trim)"
+    } | str join (char newline)
+    $"($DELIMITER)(char newline)($properties)(char newline)($DELIMITER)(char newline)"
+}
+
 # ----------------------------------------------------------------------------
 #                           Session related commands
 # ----------------------------------------------------------------------------
@@ -486,7 +497,7 @@ def get-todos [
     | query db r#'
         SELECT
             t.id AS todo_id,
-            t.title AS todo_title,
+            t.todo AS todo_content,
             t.column_id AS todo_column_id,
             p.name AS project_name,
             c.name AS column_name,
@@ -506,6 +517,36 @@ def get-todos [
 @example 'An invalid column descriptor' { 'Baz:7' | parse-column }
 def parse-column []: string -> table {
     $in | parse -r '^(?:(?<position>\d+):)?(?<name>[a-zA-Z_]\w*)$' | default -e 1 position
+}
+
+# Parses the pipelined content of the task to retrieve its parameters.
+def parse-todo []: string -> record {
+    const HEADER_DELIMITER = '---'
+
+    let $input = $in | lines | compact
+
+    mut in_header = false
+    mut properties = {}
+
+    for l in $input {
+        if ($l == $HEADER_DELIMITER) and (not $in_header) {
+            $in_header = true
+            continue
+        } else if ($l == $HEADER_DELIMITER) and $in_header {
+            break
+        }
+
+        if $in_header {
+            let parsed_line = $l | parse '{key}:{value}'
+            if ($parsed_line | is-empty) { continue }
+
+            $properties = (match ($parsed_line.0.key | str trim | str downcase) {
+                title => { $properties | upsert title ($parsed_line.0.value | str trim) }
+            })
+        }
+    }
+
+    $properties
 }
 
 # ----------------------------------------------------------------------------
@@ -749,7 +790,7 @@ def "main todos list" [
         let todos_qry = get-todos $project_id
         mut items = []
         for t in $todos_qry {
-            $items ++= [(do $render_todo $col_width $t.column_name $t.todo_title)]
+            $items ++= [(do $render_todo $col_width $t.column_name ($t.todo_content | parse-todo | get title))]
         }
 
         print (($items | str join (char newline)) + (char newline))
@@ -775,14 +816,30 @@ def "main todos new" [
         }
 
         # Prepare the todo text to be stored
-        let todo_text = if $todo == null { temp-edit } else { $todo } | str trim
+        let todo_text = if $todo == null {
+            let buffer = {title: ''} | build-metadata-block | temp-edit | str trim
+            if $buffer == null {
+                print-msg -t warning $MESSAGES.warn_no_changes
+                return null
+            }
+            $buffer
+        } else {
+            {title: $todo} | build-metadata-block
+        } | str trim
+
+        # Parse and verify the metadata
+        let todo_data = $todo_text | parse-todo
+        if title not-in $todo_data {
+            print-msg -t error $MESSAGES.error_malformed_data
+            return null
+        }
 
         # Add the todo
         stor open | query db r#'
-        INSERT INTO todos (id, title, project_id, column_id)
-        VALUES (:id, :title, :project_id, :column_id)'# -p {
+        INSERT INTO todos (id, todo, project_id, column_id)
+        VALUES (:id, :todo, :project_id, :column_id)'# -p {
             id: (random uuid)
-            title: $todo_text
+            todo: $todo_text
             project_id: $project_id
             column_id: $column_qry.id
         }
@@ -801,7 +858,7 @@ def "main todos delete" [
 
         # Retrieve all the project's todos
         let todos_qry = get-todos $project_id
-        let selection: int = $todos_qry | list-select -t {$in.todo_title}
+        let selection: int = $todos_qry | list-select -t {$in.todo_content | (parse-todo).title }
         if $selection == null {
             print-msg -t warning $MESSAGES.warn_no_operation
             return null
@@ -842,14 +899,14 @@ def "main todos move" [
 
         # Select the todo
         let todos_qry = get-todos $project_id | where todo_column_id == $from_column_qry.id
-        let selection: int = $todos_qry | list-select -t {$in.todo_title}
+        let selection: int = $todos_qry | list-select -t {$in.todo_content | (parse-todo).title}
         if $selection == null {
             print-msg -t warning $MESSAGES.warn_no_operation
             return null
         }
 
         stor open | query db 'UPDATE todos SET column_id = :column_id WHERE id = :id' -p {
-            id: (get-todos $project_id | (get $selection).todo_id)
+            id: ($todos_qry | (get $selection).todo_id)
             column_id: $to_column_qry.id
         }
         print-msg -t success $MESSAGES.success_todos_renamed {old_column: $from_column new_column: $to_column}
@@ -867,27 +924,66 @@ def "main todos edit" [
 
         # Select the todo
         let todos_qry = get-todos $project_id
-        let selection: int = $todos_qry | list-select -t {$in.todo_title}
+        let selection: int = $todos_qry | list-select -t {$in.todo_content | (parse-todo).title }
         if $selection == null {
             print-msg -t warning $MESSAGES.warn_no_operation
             return null
         }
 
         # Edit the todo
-        let todo_text = $todos_qry | (get $selection).todo_title
-        let edited_text = $todo_text | temp-edit
-        if $edited_text == $todo_text {
+        let todo_text = $todos_qry | (get $selection).todo_content
+        let buffer = $todo_text | temp-edit
+        if $buffer == $todo_text {
             print-msg -t warning $MESSAGES.warn_no_changes
             return null
         }
 
-        stor open | query db 'UPDATE todos SET title = :title WHERE id = :id' -p {
+        # Parse and verify the metadata
+        let todo_data = $todo_text | parse-todo
+        if title not-in $todo_data {
+            print-msg -t error $MESSAGES.error_malformed_data
+            return null
+        }
+
+        stor open | query db 'UPDATE todos SET todo = :todo WHERE id = :id' -p {
             id: ($todos_qry | (get $selection).todo_id)
-            title: $edited_text
+            todo: $buffer
         }
         print-msg -t success $MESSAGES.success_todos_updated
     }
 }
+
+# Shows the todo details.
+def "main todos view" [
+    --project (-p): string # Project name
+] {
+    db-state-wrapper {||
+        # Retrieve the project
+        let project_id = get-project-id $project
+        if $project_id == null { return null }
+
+        # Select the todo
+        let todos_qry = get-todos $project_id
+        let selection: int = $todos_qry | list-select -t {$in.todo_content | (parse-todo).title}
+        if $selection == null {
+            print-msg -t warning $MESSAGES.warn_no_operation
+            return null
+        }
+
+        # Prints out the details
+        let todo_text = $todos_qry | (get $selection).todo_content
+        if (which glow | is-not-empty) {
+            $todo_text | glow -pn
+        } else if (which bat | is-not-empty) {
+            $todo_text | bat -p -l markdown --italic-text=always
+        } else if PAGER in $env {
+            $todo_text | ^$env.PAGER
+        } else {
+            print $"($todo_text)(char newline)"
+        }
+    }
+}
+
 
 # ----------------------------------------------------------------------------
 #                                    Tasks
@@ -933,8 +1029,7 @@ def "main tasks list" [] {
 def "main tasks new" [] {
     db-state-wrapper -s {||
         # Create the task
-        const TASK_TMPL = $"---(char newline)title:(char newline)expires:(char newline)completed:(char newline)---(char newline)"
-        let task_text = $TASK_TMPL | temp-edit | str trim
+        let task_text = {title: '' expires: '' completed: ''} | build-metadata-block | temp-edit | str trim
         if $task_text == null {
             print-msg -t warning $MESSAGES.warn_no_changes
             return null
@@ -943,7 +1038,7 @@ def "main tasks new" [] {
         # Parse and verify the metadata
         let task_data = $task_text | parse-task
         if title not-in $task_data {
-            print-msg -t error $MESSAGES.error_tasks_malformed_data
+            print-msg -t error $MESSAGES.error_malformed_data
             return null
         }
 
@@ -1004,7 +1099,7 @@ def "main tasks edit" [] {
         # Check and save the changes
         let task_data = $edited_task | parse-task
         if title not-in $task_data {
-            print-msg -t error $MESSAGES.error_tasks_malformed_data
+            print-msg -t error $MESSAGES.error_malformed_data
             return null
         }
 
@@ -1140,6 +1235,10 @@ def "main completion" [] {
     export extern "nudo todos edit" [
         --project (-p): string@complete-projects    # Project name
     ]
+    # Shows the todo details.
+    def "main todos view" [
+        --project (-p): string@completion-projects  # Project name
+    ]
 
     # Shows all the registered tasks.
     export extern "nudo tasks list" []
@@ -1153,7 +1252,7 @@ def "main completion" [] {
     export extern "nudo tasks view" []
 }
 use "nudo completions" *
-    '#
+    '# #'
 }
 
 # NuDo - Simple Self-Contained Todo/Task CLI Tool for Nushell
@@ -1196,8 +1295,8 @@ def main [
                 closure: {|r| [$r.column_id $r.project_id $r.position]}
             }
             todos: {
-                query: 'INSERT INTO todos (id, title, project_id, column_id) VALUES (?, ?, ?, ?)'
-                closure: {|r| [$r.id $r.title $r.project_id $r.column_id]}
+                query: 'INSERT INTO todos (id, todo, project_id, column_id) VALUES (?, ?, ?, ?)'
+                closure: {|r| [$r.id $r.todo $r.project_id $r.column_id]}
             }
             tasks: {
                 query: 'INSERT INTO tasks (id, task, creation_date, expiration_date, completion_date) VALUES (?, ?, ?, ?, ?)'
