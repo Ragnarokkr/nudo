@@ -1236,8 +1236,8 @@ def "main completion" [] {
         --project (-p): string@complete-projects    # Project name
     ]
     # Shows the todo details.
-    def "main todos view" [
-        --project (-p): string@completion-projects  # Project name
+    export extern "nudo todos view" [
+        --project (-p): string@complete-projects    # Project name
     ]
 
     # Shows all the registered tasks.
