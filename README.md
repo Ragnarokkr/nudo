@@ -14,7 +14,7 @@ A simple, self-contained Todo/Task CLI tool built for [Nushell].
     - [TODOs](#todos)
     - [Tasks](#tasks)
 - [Configuration](#configuration)
-- [File Locations](#default-file-locations)
+- [Default File Locations](#default-file-locations)
 - [Dependencies](#dependencies)
 - [License](#license)
 
@@ -32,6 +32,7 @@ integration for data persistence.
 - **Self-Contained**: Everything runs from a single script and stores data in a local SQLite database.
 - **Cross-Platform**: Supports Linux and Windows.
 - **Integrated Editing**: Uses your system's `$EDITOR` or `$VISUAL` for creating and editing items.
+- **Markdown Support**: TODOs and task can be written in Markdown with metadata block.
 - **Beautiful Output**: Color-coded terminal output with optional support for [glow] or [bat] for task viewing.
 
 ## Installation
@@ -81,6 +82,20 @@ TODOs are items within a project's columns.
 | Edit TODO   | `nudo todos edit`                       |
 | List TODOs  | `nudo todos list`                       |
 | Move TODO   | `nudo todos move "todo" "done"`         |
+| View TODO   | `nudo todos view`                       |
+
+All `todos` sub-commands accept the option `--project` to choose a different
+project from the default one.
+
+The default metadata block is as follows:
+
+```md
+---
+title: todo title
+---
+```
+
+The `title` field is mandatory.
 
 ### Tasks
 
@@ -94,7 +109,7 @@ Tasks are standalone items that include a Markdown-like header for metadata.
 | List tasks  | `nudo tasks list`   |
 | View task   | `nudo tasks view`   |
 
-The default header is as follows:
+The default metadata block is as follows:
 
 ```md
 ---
